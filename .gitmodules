@@ -1,3 +1,0 @@
-[submodule "third_party/vla-cache"]
-	path = third_party/vla-cache
-	url = https://github.com/siyuhsu/vla-cache.git

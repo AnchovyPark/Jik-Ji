@@ -41,7 +41,8 @@ class PrefillOut:
 
 
 class StaticOpenVLA:
-    def __init__(self, hf_model, device, dtype=torch.bfloat16, text_slots=48, decode_slots=8):
+    def __init__(self, hf_model, device, dtype=torch.bfloat16, text_slots=48, decode_slots=8,
+                 pruning_loc=(2, 6, 9, 11), compile=None):
         cfg = hf_model.language_model.config
         self.device, self.dtype = device, dtype
         self.n_layers = cfg.num_hidden_layers
@@ -55,6 +56,10 @@ class StaticOpenVLA:
         self.pad_token_id = cfg.pad_token_id if cfg.pad_token_id is not None else 32000
 
         self.vision_backbone = hf_model.vision_backbone.to(device=device, dtype=dtype).eval()
+        # timm's fused SDPA path checks isneginf on XLA, forcing a host sync (graph break) per ViT block
+        for mod in self.vision_backbone.modules():
+            if hasattr(mod, "fused_attn"):
+                mod.fused_attn = False
         self.projector = hf_model.projector.to(device=device, dtype=dtype).eval()
 
         lm = hf_model.language_model.model
@@ -78,7 +83,19 @@ class StaticOpenVLA:
         inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
         self.inv_freq = inv_freq.to(device)
         self.slot_pos = torch.arange(self.n_slots, device=device)
+        self.pruning_loc = tuple(pruning_loc)
         self.reset_kv()
+
+        # On XLA, torch.compile caches one traced graph per input shape, so a step costs a
+        # graph lookup instead of re-tracing ~1k ops in Python (lazy-tensor mode).
+        if compile is None:
+            compile = device.type == "xla"
+        self._embed, self._prefill, self._decode = self._embed_fn, self._prefill_fn, self._decode_fn
+        if compile:
+            opts = dict(backend="openxla", fullgraph=True, dynamic=False)
+            self._embed = torch.compile(self._embed_fn, **opts)
+            self._prefill = torch.compile(self._prefill_fn, **opts)
+            self._decode = torch.compile(self._decode_fn, **opts)
 
     def reset_kv(self):
         shape = (1, self.n_kv_heads, self.n_slots, self.head_dim)
@@ -99,8 +116,9 @@ class StaticOpenVLA:
         x1, x2 = x[..., : self.head_dim // 2], x[..., self.head_dim // 2 :]
         return x * cos + torch.cat([-x2, x1], -1) * sin
 
-    def _layer(self, i, h, pos, want_probs=False):
-        """h [1, n, d], pos [n] (also the KV slot of each row). Returns h and head-mean probs [n, S]."""
+    def _layer(self, i, h, pos, kb, vb, want_probs=False):
+        """h [1, n, d], pos [n] (also the KV slot of each row), kb/vb this layer's KV buffer.
+        Returns h, updated kb, vb, and head-mean attention probs [n, S]."""
         p = self.layers[i]
         n = h.shape[1]
         H, Hk, Dh = self.n_heads, self.n_kv_heads, self.head_dim
@@ -109,9 +127,9 @@ class StaticOpenVLA:
         q = self._rope(q.view(1, n, H, Dh).transpose(1, 2), pos)
         k = self._rope(k.view(1, n, Hk, Dh).transpose(1, 2), pos)
         v = v.view(1, n, Hk, Dh).transpose(1, 2)
-        self.k_buf[i] = self.k_buf[i].index_copy(2, pos, k)
-        self.v_buf[i] = self.v_buf[i].index_copy(2, pos, v)
-        kk, vv = self.k_buf[i], self.v_buf[i]
+        kb = kb.index_copy(2, pos, k)
+        vb = vb.index_copy(2, pos, v)
+        kk, vv = kb, vb
         if Hk != H:
             kk = kk.repeat_interleave(H // Hk, 1)
             vv = vv.repeat_interleave(H // Hk, 1)
@@ -124,7 +142,7 @@ class StaticOpenVLA:
         x = self._rms(h, p["ln2"])
         g, u = (x @ p["wgu"].t()).chunk(2, -1)
         h = h + (F.silu(g) * u) @ p["wd"].t()
-        return h, (probs.float().mean(1)[0] if want_probs else None)
+        return h, kb, vb, (probs.float().mean(1)[0] if want_probs else None)
 
     @staticmethod
     def _entropy(attn, row_valid):
@@ -138,12 +156,59 @@ class StaticOpenVLA:
         x = self._rms(h_row, self.final_norm)
         return (x @ self.lm_head.t()).float().argmax(-1)
 
-    # ---------------------------------------------------------------- graphs
-    @torch.no_grad()
-    def encode_image(self, pixel_values):
-        return self.projector(self.vision_backbone(pixel_values.to(self.device, self.dtype)))
+    # ---------------------------------------------------------------- pure graph functions
+    # KV buffers go in and come out explicitly so each function is a pure, fixed-shape graph.
+    @staticmethod
+    def _vit_penultimate(vit, x):
+        # == timm get_intermediate_layers(n={len(blocks) - 2}) as Prismatic uses it, minus the
+        # set() bookkeeping that dynamo cannot trace: output of the second-to-last block, no prefix tokens
+        x = vit.norm_pre(vit.patch_drop(vit._pos_embed(vit.patch_embed(x))))
+        for blk in vit.blocks[: len(vit.blocks) - 1]:
+            x = blk(x)
+        return x[:, vit.num_prefix_tokens:]
 
-    def build_embeds(self, input_ids, vision_embeds):
+    def _embed_fn(self, pixel_values, bos, txt):
+        vb = self.vision_backbone
+        if vb.use_fused_vision_backbone:
+            img, img_fused = torch.split(pixel_values, [3, 3], dim=1)
+            patches = torch.cat([self._vit_penultimate(vb.featurizer, img),
+                                 self._vit_penultimate(vb.fused_featurizer, img_fused)], dim=2)
+        else:
+            patches = self._vit_penultimate(vb.featurizer, pixel_values)
+        vision = self.projector(patches)
+        return torch.cat([self.embed[bos][None], vision, self.embed[txt][None]], 1)
+
+    def _prefill_fn(self, embeds, prompt_len, last_row, k_bufs, v_bufs, keep_idx):
+        h = embeds
+        pos = self.slot_pos[: self.prompt_slots]
+        text_hi = torch.clamp(prompt_len, max=TEXT_START + ORIG_TEXT_LEN)
+        k_bufs, v_bufs = list(k_bufs), list(v_bufs)
+        entropies, t2v = [], None
+        ki = 0
+        for i in range(self.n_layers):
+            if keep_idx and ki < len(self.pruning_loc) and i == self.pruning_loc[ki]:
+                h = h.index_select(1, keep_idx[ki])
+                pos = pos.index_select(0, keep_idx[ki])
+                ki += 1
+            h, k_bufs[i], v_bufs[i], attn = self._layer(i, h, pos, k_bufs[i], v_bufs[i], want_probs=True)
+            entropies.append(self._entropy(attn, pos < prompt_len))
+            if i == ATTN_LAYER:
+                text_rows = ((pos >= TEXT_START) & (pos < text_hi)).float()
+                vis = attn[:, VISION_START:TEXT_START]
+                t2v = (vis * text_rows[:, None]).sum(0) / text_rows.sum()
+        token = self._logits_argmax(h.index_select(1, last_row.view(1))[:, 0])
+        return token, torch.stack(entropies), t2v, k_bufs, v_bufs
+
+    def _decode_fn(self, token, pos, k_bufs, v_bufs):
+        h = self.embed[token][None]
+        k_bufs, v_bufs = list(k_bufs), list(v_bufs)
+        for i in range(self.n_layers):
+            h, k_bufs[i], v_bufs[i], _ = self._layer(i, h, pos, k_bufs[i], v_bufs[i])
+        return self._logits_argmax(h[:, -1]), k_bufs, v_bufs
+
+    # ---------------------------------------------------------------- stateful wrappers
+    @torch.no_grad()
+    def build_embeds(self, input_ids, pixel_values):
         """input_ids: [1, T] host tensor starting with BOS. Returns ([1, P, d], prompt_len)."""
         ids = input_ids[0].tolist()
         text = ids[1:]
@@ -151,40 +216,23 @@ class StaticOpenVLA:
         text = text + [self.pad_token_id] * (self.prompt_slots - TEXT_START - len(text))
         bos = torch.tensor([ids[0]], device=self.device)
         txt = torch.tensor(text, device=self.device)
-        emb = torch.cat([self.embed[bos][None], vision_embeds, self.embed[txt][None]], 1)
+        emb = self._embed(pixel_values.to(self.device, self.dtype), bos, txt)
         return emb, len(ids) + NUM_PATCHES
 
     @torch.no_grad()
-    def prefill(self, embeds, prompt_len, keep_idx=None, last_row=None, pruning_loc=(2, 6, 9, 11)):
-        """embeds [1, P, d]. keep_idx: None (full) or one device index tensor per pruning point,
-        indexing into the rows alive before that point. last_row: row of the last prompt token
-        among the rows alive after the final pruning point (device scalar)."""
-        h = embeds
-        pos = self.slot_pos[: self.prompt_slots]
-        prompt_len_t = torch.tensor(prompt_len, device=self.device)
-        text_hi = torch.clamp(prompt_len_t, max=TEXT_START + ORIG_TEXT_LEN)
-        entropies, t2v = [], None
-        ki = 0
-        for i in range(self.n_layers):
-            if keep_idx is not None and ki < len(pruning_loc) and i == pruning_loc[ki]:
-                h = h.index_select(1, keep_idx[ki])
-                pos = pos.index_select(0, keep_idx[ki])
-                ki += 1
-            h, attn = self._layer(i, h, pos, want_probs=True)
-            entropies.append(self._entropy(attn, pos < prompt_len_t))
-            if i == ATTN_LAYER:
-                text_rows = ((pos >= TEXT_START) & (pos < text_hi)).float()
-                vis = attn[:, VISION_START:TEXT_START]
-                t2v = (vis * text_rows[:, None]).sum(0) / text_rows.sum()
+    def prefill(self, embeds, prompt_len, keep_idx=None, last_row=None):
+        """keep_idx: None (full) or one device index tensor per pruning point, indexing into the
+        rows alive before that point. last_row: row of the last prompt token among the rows
+        alive after the final pruning point."""
         if last_row is None:
-            last_row = prompt_len_t - 1
-        token = self._logits_argmax(h[:, last_row])
-        return PrefillOut(token=token, entropy=torch.stack(entropies), text2vision=t2v)
+            last_row = prompt_len - 1
+        token, ent, t2v, self.k_buf, self.v_buf = self._prefill(
+            embeds, torch.tensor(prompt_len, device=self.device), torch.tensor(last_row, device=self.device),
+            self.k_buf, self.v_buf, keep_idx or [])
+        return PrefillOut(token=token, entropy=ent, text2vision=t2v)
 
     @torch.no_grad()
     def decode(self, token, pos):
         """token [1] device int, pos [1] device int (slot to write)."""
-        h = self.embed[token][None]
-        for i in range(self.n_layers):
-            h, _ = self._layer(i, h, pos)
-        return self._logits_argmax(h[:, -1])
+        token, self.k_buf, self.v_buf = self._decode(token, pos, self.k_buf, self.v_buf)
+        return token

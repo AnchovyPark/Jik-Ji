@@ -67,7 +67,7 @@ def main():
 
     model, proc = load(args.ckpt, torch.bfloat16)
     frames = synthetic_stream(args.frames)
-    from jikji.openvla_static import StaticOpenVLA
+    from openvla_static import StaticOpenVLA
 
     static_model = StaticOpenVLA(model, xm.xla_device())
     results, ref = {}, None

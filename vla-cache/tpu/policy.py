@@ -75,16 +75,14 @@ class VLACachePolicy:
         t["host_plan"] = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        vision = self.model.encode_image(pixels)
-        embeds, prompt_len = self.model.build_embeds(ids, vision)
+        embeds, prompt_len = self.model.build_embeds(ids, pixels)
         if plan is None:
             out = self.model.prefill(embeds, prompt_len)
             info = dict(rows=None)
         else:
             keep_idx, last_row, info = plan
             keep = [torch.from_numpy(k).to(self.device) for k in keep_idx]
-            out = self.model.prefill(embeds, prompt_len, keep_idx=keep,
-                                     last_row=torch.tensor(last_row, device=self.device))
+            out = self.model.prefill(embeds, prompt_len, keep_idx=keep, last_row=last_row)
         _sync(self.device)
         t["prefill"] = time.perf_counter() - t0
 

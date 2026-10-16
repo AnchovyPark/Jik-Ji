@@ -15,7 +15,19 @@ import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-sys.path.insert(0, os.path.join(HERE, "..", "src", "openvla"))
+OPENVLA = os.path.join(HERE, "..", "src", "openvla")
+sys.path.insert(0, OPENVLA)
+# prismatic/__init__ pulls in training deps (dlimp, RLDS); inference only needs prismatic.extern.hf
+_pkg = types.ModuleType("prismatic")
+_pkg.__path__ = [os.path.join(OPENVLA, "prismatic")]
+sys.modules["prismatic"] = _pkg
+
+from frames import synthetic_stream  # noqa: E402
+from check_equivalence import TASK  # noqa: E402
+from experiments.robot.openvla_utils import get_vla_action  # noqa: E402
+from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction  # noqa: E402
+from prismatic.extern.hf.processing_prismatic import PrismaticProcessor  # noqa: E402
+
 
 # The fork's LlamaModel.forward times itself with CUDA events; make them no-ops on CPU.
 if not torch.cuda.is_available():
@@ -26,11 +38,21 @@ if not torch.cuda.is_available():
     torch.cuda.Event = _Event
     torch.cuda.synchronize = lambda *a, **k: None
 
-from frames import synthetic_stream  # noqa: E402
-from check_equivalence import TASK  # noqa: E402
-from experiments.robot.openvla_utils import get_vla_action  # noqa: E402
-from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction  # noqa: E402
-from prismatic.extern.hf.processing_prismatic import PrismaticProcessor  # noqa: E402
+
+class _CastingProcessor:
+    """get_vla_action casts inputs with .to(DEVICE, dtype=torch.bfloat16); redirect that cast."""
+
+    def __init__(self, proc, dtype):
+        self.proc, self.dtype, self.tokenizer = proc, dtype, proc.tokenizer
+
+    def __call__(self, *args, **kwargs):
+        feats, dtype = self.proc(*args, **kwargs), self.dtype
+
+        class _Feats(dict):
+            def to(self, device, dtype_=None, **kw):
+                return feats.to(device, dtype=dtype)
+
+        return _Feats(feats)
 
 
 def main():
@@ -38,12 +60,20 @@ def main():
     ap.add_argument("--ckpt", default=os.path.expanduser("~/models/openvla-7b-finetuned-libero-spatial"))
     ap.add_argument("--frames", type=int, default=6)
     ap.add_argument("--out", default=os.path.join(HERE, "results", "ref_tokens.json"))
+    ap.add_argument("--dtype", default="float32", help="CPU bf16 kernels are near single-threaded here")
     args = ap.parse_args()
+    dtype = getattr(torch, args.dtype)
 
-    vla = OpenVLAForActionPrediction.from_pretrained(args.ckpt, torch_dtype=torch.bfloat16).eval()
+    vla = OpenVLAForActionPrediction.from_pretrained(args.ckpt, torch_dtype=dtype).eval()
     vla.language_model.model.all_FLOPs = 0
     vla.norm_stats = json.load(open(os.path.join(args.ckpt, "dataset_statistics.json")))
-    proc = PrismaticProcessor.from_pretrained(args.ckpt)
+    from transformers import AutoTokenizer
+    from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor
+
+    proc = PrismaticProcessor(image_processor=PrismaticImageProcessor.from_pretrained(args.ckpt),
+                              tokenizer=AutoTokenizer.from_pretrained(args.ckpt))
+    if dtype != torch.bfloat16:
+        proc = _CastingProcessor(proc, dtype)
     cfg = types.SimpleNamespace(use_vla_cache=True)
 
     frames = synthetic_stream(args.frames)

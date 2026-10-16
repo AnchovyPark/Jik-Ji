@@ -92,6 +92,8 @@ class StaticOpenVLA:
             compile = device.type == "xla"
         self._embed, self._prefill, self._decode = self._embed_fn, self._prefill_fn, self._decode_fn
         if compile:
+            # one cache entry per bucket shape; "dynamic" mode deliberately produces many
+            torch._dynamo.config.cache_size_limit = 1024
             opts = dict(backend="openxla", fullgraph=True, dynamic=False)
             self._embed = torch.compile(self._embed_fn, **opts)
             self._prefill = torch.compile(self._prefill_fn, **opts)

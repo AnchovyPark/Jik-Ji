@@ -39,6 +39,18 @@ class VLACachePolicy:
         self.model.reset_kv()
         self.prev_image, self.prev_stats, self.prev_prompt = None, None, None
 
+    # Per-episode state, so one device model can interleave several concurrent episodes.
+    def get_state(self):
+        return dict(prev_image=self.prev_image, prev_stats=self.prev_stats, prev_prompt=self.prev_prompt,
+                    k_buf=self.model.k_buf, v_buf=self.model.v_buf)
+
+    def set_state(self, state):
+        if state is None:
+            self.reset()
+            return
+        self.prev_image, self.prev_stats, self.prev_prompt = state["prev_image"], state["prev_stats"], state["prev_prompt"]
+        self.model.k_buf, self.model.v_buf = state["k_buf"], state["v_buf"]
+
     def _input_ids(self, task_label):
         prompt = f"In: What action should the robot take to {task_label.lower()}?\nOut:"
         ids = self.processor.tokenizer(prompt, return_tensors="pt").input_ids

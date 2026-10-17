@@ -1,0 +1,63 @@
+{
+ "episodes": 20,
+ "successes": 11,
+ "steps_total": 3140,
+ "steps_with_plan": 3120,
+ "static_patches": {
+  "mean": 130.0,
+  "p10": 130.0,
+  "p50": 130.0,
+  "p90": 130.0,
+  "min": 130,
+  "max": 130
+ },
+ "reusable_tokens": {
+  "mean": 74.10320512820513,
+  "p10": 67.0,
+  "p50": 73.0,
+  "p90": 82.0,
+  "min": 60,
+  "max": 97
+ },
+ "rows_dropped_last_segment": {
+  "mean": 69.92660256410257,
+  "p10": 63.0,
+  "p50": 69.0,
+  "p90": 78.0,
+  "min": 57,
+  "max": 92
+ },
+ "unique_exact_row_tuples": 219,
+ "per_task": {
+  "0": {
+   "reusable_mean": 74.23102310231023
+  },
+  "1": {
+   "reusable_mean": 75.22699386503068
+  },
+  "2": {
+   "reusable_mean": 69.66467065868264
+  },
+  "3": {
+   "reusable_mean": 72.22916666666667
+  },
+  "4": {
+   "reusable_mean": 75.63013698630137
+  },
+  "5": {
+   "reusable_mean": 72.3
+  },
+  "6": {
+   "reusable_mean": 76.08562691131499
+  },
+  "7": {
+   "reusable_mean": 72.3082191780822
+  },
+  "8": {
+   "reusable_mean": 74.8051948051948
+  },
+  "9": {
+   "reusable_mean": 77.44108761329305
+  }
+ }
+}

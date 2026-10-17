@@ -27,12 +27,15 @@ def _sync(device):
 
 class VLACachePolicy:
     def __init__(self, hf_model, processor, device, mode="static", bucket=32, unnorm_key="libero_spatial",
-                 static_top_k=130, task_top_k=120, sim_threshold=0.996, dtype=torch.bfloat16, static_model=None):
+                 static_top_k=130, task_top_k=120, sim_threshold=0.996, dtype=torch.bfloat16, static_model=None,
+                 record_plan=False):
         self.hf, self.processor, self.device = hf_model, processor, device
         self.model = static_model or StaticOpenVLA(hf_model, device, dtype=dtype)
         self.mode, self.bucket, self.unnorm_key = mode, bucket, unnorm_key
         self.static_top_k, self.task_top_k, self.sim_threshold = static_top_k, task_top_k, sim_threshold
         self.action_dim = hf_model.get_action_dim(unnorm_key)
+        # mode "off" + record_plan: execute full prefill but log the exact VLA-Cache plan (trace collection)
+        self.record_plan = record_plan
         self.reset()
 
     def reset(self):
@@ -60,7 +63,7 @@ class VLACachePolicy:
 
     def _plan(self, image, prompt_len):
         """Returns (keep_idx, last_row, info) or None for a full prefill."""
-        if self.mode == "off" or self.prev_stats is None:
+        if (self.mode == "off" and not self.record_plan) or self.prev_stats is None:
             return None
         entropy, t2v = self.prev_stats
         static = host.find_static_patches(image, self.prev_image, top_k=self.static_top_k,
@@ -69,10 +72,14 @@ class VLACachePolicy:
         reusable = host.reusable_tokens(static, task, VISION_START)
         if not reusable:
             return None
-        bucket = 1 if self.mode == "dynamic" else self.bucket
-        keep_idx, last_row, counts = host.plan_rows(reusable, host.layer_schedule(entropy),
-                                                    self.model.prompt_slots, prompt_len - 1, bucket=bucket)
-        return keep_idx, last_row, dict(n_static=len(static), n_reusable=len(reusable), rows=counts)
+        bucket = self.bucket if self.mode == "static" else 1
+        props = host.layer_schedule(entropy)
+        keep_idx, last_row, counts = host.plan_rows(reusable, props, self.model.prompt_slots, prompt_len - 1,
+                                                    pruning_loc=self.model.pruning_loc, bucket=bucket)
+        info = dict(n_static=len(static), n_reusable=len(reusable), rows=counts)
+        if self.record_plan:
+            info.update(reusable=reusable, proportions=[float(props[l]) for l in self.model.pruning_loc])
+        return keep_idx, last_row, info
 
     @torch.no_grad()
     def step(self, image, task_label):
@@ -84,13 +91,16 @@ class VLACachePolicy:
             self.reset()
         pixels = self.processor.image_processor(image, return_tensors="pt")["pixel_values"]
         plan = self._plan(image, ids.shape[1] + NUM_PATCHES)
+        plan_info = plan[2] if plan is not None else {}
+        if self.mode == "off":
+            plan = None
         t["host_plan"] = time.perf_counter() - t0
 
         t0 = time.perf_counter()
         embeds, prompt_len = self.model.build_embeds(ids, pixels)
         if plan is None:
             out = self.model.prefill(embeds, prompt_len)
-            info = dict(rows=None)
+            info = dict(rows=None, **({"plan": plan_info} if plan_info else {}))
         else:
             keep_idx, last_row, info = plan
             keep = [torch.from_numpy(k).to(self.device) for k in keep_idx]
@@ -109,7 +119,7 @@ class VLACachePolicy:
         t["decode"] = time.perf_counter() - t0
 
         self.prev_image, self.prev_stats, self.prev_prompt = image, (entropy, t2v), ids
-        return self._detokenize(token_ids), token_ids, dict(timing=t, **info)
+        return self._detokenize(token_ids), token_ids, dict(timing=t, prompt_len=prompt_len, **info)
 
     def _detokenize(self, token_ids):
         bins = self.hf.vocab_size - token_ids

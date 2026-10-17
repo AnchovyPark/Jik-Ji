@@ -73,6 +73,7 @@ def main():
     ap.add_argument("--trials", default="0-49", help="episode (init state) indices")
     ap.add_argument("--envs", type=int, default=4)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--record-dir", default=None, help="save frames + exact VLA-Cache plans per episode")
     args = ap.parse_args()
 
     pin_chip(args.chip)
@@ -96,7 +97,10 @@ def main():
     log = open(out_path, "a")
 
     model, proc = load(args.ckpt, torch.bfloat16)
-    policy = VLACachePolicy(model, proc, xm.xla_device(), mode=args.mode, bucket=args.bucket, unnorm_key=args.suite)
+    policy = VLACachePolicy(model, proc, xm.xla_device(), mode=args.mode, bucket=args.bucket, unnorm_key=args.suite,
+                            record_plan=args.record_dir is not None)
+    if args.record_dir:
+        os.makedirs(args.record_dir, exist_ok=True)
 
     queue = [(t, e) for t in parse_range(args.tasks) for e in parse_range(args.trials) if (t, e) not in done_eps]
     workers = [EnvWorker(7000 + 100 * args.chip + i, args.suite) for i in range(min(args.envs, len(queue)))]
@@ -107,7 +111,7 @@ def main():
         task_id, ep = queue.pop(0)
         r = w.call(cmd="reset", task_id=task_id, episode=ep)
         return dict(task_id=task_id, episode=ep, task=r["task"], image=r["image"], t=0, state=None, steps=[],
-                    pending=False)
+                    pending=False, frames=[], plans=[])
 
     def act(a, w):
         """Policy step for one episode; the env step is sent without waiting so the simulator
@@ -119,6 +123,9 @@ def main():
         # original post-processing: gripper [0,1] -> [-1,1], binarize, invert for OpenVLA
         action = action.copy()
         action[-1] = -np.sign(2 * action[-1] - 1)
+        if args.record_dir:
+            a["frames"].append(np.frombuffer(a["image"], np.uint8).reshape(224, 224, 3))
+            a["plans"].append(dict(info.get("plan", {}), prompt_len=info["prompt_len"]))
         tm = info["timing"]
         a["steps"].append([round(tm["prefill"] * 1e3, 2), round(tm["decode"] * 1e3, 2), round(tm["host_plan"] * 1e3, 2),
                            info.get("rows"), info.get("n_reusable")])
@@ -148,6 +155,10 @@ def main():
                                       episode=a["episode"], task=a["task"], success=bool(r["done"]), steps=a["t"],
                                       error=r["error"], per_step=a["steps"])) + "\n")
             log.flush()
+            if args.record_dir:
+                np.savez_compressed(os.path.join(args.record_dir, f"task{a['task_id']:02d}_ep{a['episode']:02d}.npz"),
+                                    frames=np.stack(a["frames"]), task=a["task"], task_id=a["task_id"],
+                                    episode=a["episode"], success=bool(r["done"]), plans=json.dumps(a["plans"]))
             el = time.time() - t_start
             print(f"[chip {args.chip} {args.mode}] task {a['task_id']} ep {a['episode']}: "
                   f"{'success' if r['done'] else 'fail'} in {a['t']} steps | {n_succ}/{n_done} "

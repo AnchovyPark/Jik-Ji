@@ -77,17 +77,33 @@ def latency_model(bench):
     def lat(rows):
         return full - sum(sl * (l_p - np.interp(n, xs, ys)) / n_pruned for sl, n in zip(seg_len, rows))
 
-    compile_s = float(np.median([r["compile_s"] for r in pts]))
+    # cost of a new shape for an online runtime = first call (dynamo trace + XLA compile + run)
+    compile_s = float(np.median([r["first_call_s"] for r in pts]))
     return lat, full, compile_s
 
 
-def bucket_report(eps, bench, buckets=(1, 4, 8, 16, 32, 64)):
+def bucket_report(eps, bench, buckets=(1, 4, 8, 16, 32, 64), tuples_bench=None):
     st = list(steps_of(eps))
-    lat, full, compile_s = latency_model(bench)
+    model_lat, full, compile_s = latency_model(bench)
+    measured, calib = {}, 1.0
+    if tuples_bench is not None:
+        # measured graphs (real nested gathers) override the model; the rest use the model
+        # scaled by the median measured/model saving ratio
+        full = tuples_bench["full"]["median_ms"]
+        measured = {tuple(r["rows"]): r["median_ms"] for r in tuples_bench["tuples"]}
+        ratios = [(full - v) / (full - model_lat(t)) for t, v in measured.items() if full - model_lat(t) > 0.5]
+        calib = float(np.median(ratios)) if ratios else 1.0
+
+    def lat(rows):
+        rows = tuple(rows)
+        if rows in measured:
+            return measured[rows]
+        return full - calib * (full - model_lat(rows))
+
     n_steps = len(st)
     exact = [rows_for(p, 1) for _, _, p in st]
     ideal = np.array([lat(r) for r in exact])
-    out = dict(full_prefill_ms=full, compile_s_per_graph=compile_s, steps=n_steps,
+    out = dict(full_prefill_ms=full, compile_s_per_graph=compile_s, steps=n_steps, saving_calibration=calib,
                ideal_prefill_ms=float(ideal.mean()), policies=[])
     for b in buckets:
         rows = [rows_for(p, b) for _, _, p in st]
@@ -96,7 +112,7 @@ def bucket_report(eps, bench, buckets=(1, 4, 8, 16, 32, 64)):
         wasted = np.array([sum(sl * (r - e) for sl, r, e in zip((4, 3, 2, 21), rr, ee)) / 30
                            for rr, ee in zip(rows, exact)])
         out["policies"].append(dict(
-            bucket=b, graphs=graphs, compile_s_total=graphs * compile_s,
+            bucket=b, graphs=graphs, measured_step_frac=float(np.mean([r in measured for r in rows])), compile_s_total=graphs * compile_s,
             prefill_ms=float(l.mean()), vs_ideal_pct=float(100 * (l.mean() / ideal.mean() - 1)),
             vs_full_pct=float(100 * (l.mean() / full - 1)),
             wasted_rows_per_layer=float(wasted.mean()),
@@ -110,10 +126,12 @@ def main():
     ap.add_argument("stage", choices=["trace", "buckets"])
     ap.add_argument("--traces", default=os.path.join(HERE, "results", "traces"))
     ap.add_argument("--bench", default=os.path.join(HERE, "results", "bench_rows.json"))
+    ap.add_argument("--tuples-bench", default=None)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     eps = load_traces(args.traces)
-    res = trace_stats(eps) if args.stage == "trace" else bucket_report(eps, json.load(open(args.bench)))
+    tb = json.load(open(args.tuples_bench)) if args.tuples_bench else None
+    res = trace_stats(eps) if args.stage == "trace" else bucket_report(eps, json.load(open(args.bench)), tuples_bench=tb)
     print(json.dumps(res, indent=1))
     if args.out:
         json.dump(res, open(args.out, "w"), indent=1)

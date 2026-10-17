@@ -1,0 +1,75 @@
+{
+ "full_prefill_ms": 27.05067748320289,
+ "compile_s_per_graph": 28.631241619994398,
+ "steps": 3120,
+ "saving_calibration": 0.8041156182991968,
+ "ideal_prefill_ms": 23.53956054570004,
+ "policies": [
+  {
+   "bucket": 1,
+   "graphs": 219,
+   "measured_step_frac": 0.3076923076923077,
+   "compile_s_total": 6270.241914778773,
+   "prefill_ms": 23.53956054570004,
+   "vs_ideal_pct": 0.0,
+   "vs_full_pct": -12.979774498006847,
+   "wasted_rows_per_layer": 0.0,
+   "dynamic_amortized_ms": 2033.2324819491528
+  },
+  {
+   "bucket": 4,
+   "graphs": 27,
+   "measured_step_frac": 0.316025641025641,
+   "compile_s_total": 773.0435237398488,
+   "prefill_ms": 23.494640725522178,
+   "vs_ideal_pct": -0.19082692767630194,
+   "vs_full_pct": -13.145832520789291,
+   "wasted_rows_per_layer": 1.5110470085470087,
+   "dynamic_amortized_ms": 271.2650008985506
+  },
+  {
+   "bucket": 8,
+   "graphs": 12,
+   "measured_step_frac": 0.23397435897435898,
+   "compile_s_total": 343.5748994399328,
+   "prefill_ms": 23.52332534329496,
+   "vs_ideal_pct": -0.06896986192058696,
+   "vs_full_pct": -13.039792227378545,
+   "wasted_rows_per_layer": 3.4887393162393163,
+   "dynamic_amortized_ms": 133.6434854201965
+  },
+  {
+   "bucket": 16,
+   "graphs": 6,
+   "measured_step_frac": 1.0,
+   "compile_s_total": 171.7874497199664,
+   "prefill_ms": 23.15476167755267,
+   "vs_ideal_pct": -1.6346901098697963,
+   "vs_full_pct": -14.402285517874313,
+   "wasted_rows_per_layer": 6.794551282051282,
+   "dynamic_amortized_ms": 78.21484171600343
+  },
+  {
+   "bucket": 32,
+   "graphs": 4,
+   "measured_step_frac": 1.0,
+   "compile_s_total": 114.52496647997759,
+   "prefill_ms": 23.51731127145262,
+   "vs_ideal_pct": -0.09451864746679028,
+   "vs_full_pct": -13.06202483817388,
+   "wasted_rows_per_layer": 19.946346153846154,
+   "dynamic_amortized_ms": 60.22403129708646
+  },
+  {
+   "bucket": 64,
+   "graphs": 2,
+   "measured_step_frac": 1.0,
+   "compile_s_total": 57.262483239988796,
+   "prefill_ms": 23.994702685050495,
+   "vs_ideal_pct": 1.933520120168919,
+   "vs_full_pct": -11.297220929309448,
+   "wasted_rows_per_layer": 23.361688034188038,
+   "dynamic_amortized_ms": 42.34806269786742
+  }
+ ]
+}

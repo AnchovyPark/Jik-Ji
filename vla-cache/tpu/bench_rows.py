@@ -24,6 +24,7 @@ def main():
     ap.add_argument("--step", type=int, default=8)
     ap.add_argument("--iters", type=int, default=30)
     ap.add_argument("--out", default=os.path.join(HERE, "results", "bench_rows.json"))
+    ap.add_argument("--tuples", default=None, help="json file: list of row tuples to measure with real gathers")
     args = ap.parse_args()
 
     sys.path.insert(0, HERE)
@@ -75,8 +76,24 @@ def main():
     r = timed(None, None)
     results["full"] = r
     print(f"full (no pruning graph): {r}", flush=True)
-    # drop vision tokens from the end of the image block; keep BOS, text and last token
     vision = list(range(1, 1 + NUM_PATCHES))
+    if args.tuples:
+        # real VLA-Cache graph structure: one nested gather per pruning point
+        results["tuples"] = []
+        for rows in json.load(open(args.tuples)):
+            alive = np.arange(P)
+            keep = []
+            for n in rows:
+                new_alive = np.array([p for p in range(P) if p not in set(vision[: P - n])])
+                keep.append(torch.from_numpy(np.searchsorted(alive, new_alive)).to(dev))
+                alive = new_alive
+            r = timed(keep, int(np.searchsorted(alive, plen - 1)))
+            r["rows"] = list(rows)
+            results["tuples"].append(r)
+            print(f"tuple {rows}: {r}", flush=True)
+        json.dump(results, open(args.out, "w"), indent=1)
+        return
+    # drop vision tokens from the end of the image block; keep BOS, text and last token
     for n in list(range(args.lo, P, args.step)) + [P]:
         drop = set(vision[: P - n])
         alive = np.array([p for p in range(P) if p not in drop])

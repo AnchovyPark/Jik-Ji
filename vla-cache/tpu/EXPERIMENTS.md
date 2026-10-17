@@ -118,3 +118,20 @@ layer별 재사용 비율(entropy schedule)의 평균은 [0.576, 0.950, 0.831, 0
 4. 함의: KV reuse가 의미 있으려면 prefill이 compute-bound여야 한다. 원래 목표 workload(주행, 6 cam × 576 ≈ 3,500 token prefill)가 그런 경우다. OpenVLA-LIBERO는 static-graph 이식이 맞게 동작하는지 검증하는 용도로는 충분하지만, 이득을 보여주기에는 맞지 않는다.
 
 **주의**: bucket 1/4/8 수치는 31% 이하만 실측이고 나머지는 보정 모델이다. latency는 합성 이미지로 쟀다(prefill latency는 이미지 내용과 무관하다).
+
+## 4. 성공률이 낮았던 원인: MuJoCo 버전 (2026-10-17)
+
+1단계에서 성공률이 11/20(55%)으로 OpenVLA 논문(84.7%)보다 낮았다. 정책 출력은 HF 원본과 token 단위로 같으므로(§0) 시뮬레이터 쪽을 의심했다.
+
+- 실패 episode의 frame을 보면, 팔이 그릇까지 가서 gripper를 닫지만 그릇이 들리지 않는다. 그 뒤로는 빈 gripper로 접시 위를 맴돈다. 정책이 엉뚱한 곳으로 가는 게 아니라 grasp가 미끄러지는 패턴이다.
+- 같은 20 episode(task 10 × init state 0, 1)를 MuJoCo 버전만 바꿔 다시 돌렸다. robosuite 1.4.1, 정책·전처리는 동일하다.
+
+| MuJoCo | 성공 | 비고 |
+|---|---|---|
+| 3.2.3 (pip 최신, 1단계에서 사용) | 11/20 (55%) | 3.2.3에서만 실패한 episode 6개: (0,1) (1,1) (4,1) (7,0) (7,1) (9,1) |
+| **3.1.6** | **16/20 (80%)** | OpenVLA 공개 시점(2024-06)의 pip 최신 |
+| 2.3.7 | 15/20 (75%) | |
+
+**결론**: MuJoCo 3.2.x에서 LIBERO grasp가 깨진다. 기본 시뮬레이터를 **MuJoCo 3.1.6**(`~/venvs/libero-mj316`)으로 바꿨다. 3.1.6과 2.3.7의 차이(episode 4개가 서로 엇갈림)는 20 episode 규모에서 noise 범위다.
+
+1~3단계 결과에 미치는 영향: trace는 3.2.3 궤적에서 뽑았다. 하지만 재사용 token 수는 cap과 task-relevance가 결정하고(§1 관찰 1), bucket 분석은 shape 분포만 쓰므로 결론은 그대로다.

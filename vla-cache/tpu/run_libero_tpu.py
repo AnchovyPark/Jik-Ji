@@ -16,7 +16,8 @@ import time
 from multiprocessing.connection import Client
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LIBERO_PY = os.path.expanduser("~/venvs/libero/bin/python")
+# MuJoCo 3.1.6: with 3.2.x grasps slip and LIBERO-Spatial success drops (EXPERIMENTS.md section 4)
+LIBERO_PY = os.path.expanduser("~/venvs/libero-mj316/bin/python")
 
 
 def pin_chip(chip):
@@ -35,11 +36,11 @@ def parse_range(s):
 
 
 class EnvWorker:
-    def __init__(self, port, suite):
+    def __init__(self, port, suite, python=LIBERO_PY):
         env = dict(os.environ, MUJOCO_GL="egl", PYOPENGL_PLATFORM="egl", LP_NUM_THREADS="8")
         for k in [k for k in env if k.startswith("TPU_") or k == "PJRT_DEVICE"]:
             env.pop(k)
-        self.proc = subprocess.Popen([LIBERO_PY, os.path.join(HERE, "libero_env_worker.py"), "--port", str(port),
+        self.proc = subprocess.Popen([python, os.path.join(HERE, "libero_env_worker.py"), "--port", str(port),
                                       "--suite", suite], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(600):
             try:
@@ -73,6 +74,7 @@ def main():
     ap.add_argument("--trials", default="0-49", help="episode (init state) indices")
     ap.add_argument("--envs", type=int, default=4)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--libero-python", default=LIBERO_PY, help="python of the LIBERO venv (simulator version)")
     ap.add_argument("--record-dir", default=None, help="save frames + exact VLA-Cache plans per episode")
     args = ap.parse_args()
 
@@ -103,7 +105,7 @@ def main():
         os.makedirs(args.record_dir, exist_ok=True)
 
     queue = [(t, e) for t in parse_range(args.tasks) for e in parse_range(args.trials) if (t, e) not in done_eps]
-    workers = [EnvWorker(7000 + 100 * args.chip + i, args.suite) for i in range(min(args.envs, len(queue)))]
+    workers = [EnvWorker(7000 + 100 * args.chip + i, args.suite, args.libero_python) for i in range(min(args.envs, len(queue)))]
     max_steps = workers[0].call(cmd="info")["max_steps"] if workers else 0
     print(f"chip {args.chip} mode {args.mode}: {len(queue)} episodes, {len(workers)} envs", flush=True)
 
